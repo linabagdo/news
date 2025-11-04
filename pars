@@ -1,0 +1,58 @@
+import requests
+from bs4 import BeautifulSoup
+from datetime import datetime, timedelta
+import json
+
+def parse_google_news(keyword, lang='en', period='1d'):
+    url = f"https://news.google.com/rss/search?q={keyword}&hl={lang}&gl={lang.upper()}&ceid={lang.upper()}:{lang}&when={period}"
+    
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    }
+    
+    try:
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.content, 'xml')
+        
+        news_list = []
+        items = soup.find_all('item')
+        now = datetime.now()
+        cutoff = now - timedelta(days=1) 
+        
+        for item in items:
+            title = item.find('title').text if item.find('title') else 'N/A'
+            link = item.find('link').text if item.find('link') else 'N/A'
+            source = item.find('source').text if item.find('source') else 'N/A'
+            pub_date = item.find('pubDate').text if item.find('pubDate') else 'N/A'
+            
+            
+            if pub_date != 'N/A':
+                try:
+                    dt = datetime.strptime(pub_date, '%a, %d %b %Y %H:%M:%S %Z')
+                    if dt < cutoff:  
+                        continue
+                    pub_date = dt.strftime('%Y-%m-%d %H:%M:%S')
+                except ValueError:
+                    pass  
+            
+            news_list.append({
+                'title': title,
+                'link': link,
+                'source': source,
+                'time': pub_date
+            })
+        
+        return news_list
+    
+    except requests.RequestException as e:
+        print(f"Ошибка при запросе: {e}")
+        return []
+
+
+if __name__ == "__main__":
+    keyword = "Apple"
+    results = parse_google_news(keyword, lang='en', period='1d')
+    
+    print(json.dumps(results, indent=4, ensure_ascii=False))
