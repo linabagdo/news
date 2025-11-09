@@ -1,0 +1,149 @@
+import re
+import math
+from collections import defaultdict
+
+# === Настройки (остаются те же) ===
+SIMILARITY_THRESHOLD = 0.75
+EQUAL = 0.9
+NOT_EQUAL = 0.2
+MIN_WORD_LEN = 2
+STOP_WORDS = {"the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with", "by", "is", "are", "was", "were", "be", "that", "this", "it", "as", "not", "no"}
+
+# === Предобработка (без изменений) ===
+def normalize_title(title: str) -> str:
+    title = re.sub(r"[^\w\s]", " ", title.lower())
+    title = re.sub(r"\s+", " ", title).strip()
+    return title
+
+def tokenize(title: str) -> list[str]:
+    words = normalize_title(title).split()
+    return [w for w in words if len(w) >= MIN_WORD_LEN and w not in STOP_WORDS]
+
+def similarity(set1: set, set2: set) -> float:
+    if not set1 and not set2:
+        return 1.0
+    if not set1 or not set2:
+        return 0.0
+    return len(set1 & set2) / len(set1 | set2)
+
+def build_vocab(titles: list[str]) -> dict[str, int]:
+    vocab = {}
+    for title in titles:
+        for word in tokenize(title):
+            if word not in vocab:
+                vocab[word] = len(vocab)
+    return vocab
+
+def title_to_tf_vector(title: str, vocab: dict[str, int]) -> list[float]:
+    words = tokenize(title)
+    if not words:
+        return [0.0] * len(vocab)
+    freq = defaultdict(int)
+    for w in words:
+        freq[w] += 1
+    vec = [0.0] * len(vocab)
+    for w, count in freq.items():
+        if w in vocab:
+            vec[vocab[w]] = count
+    return vec
+
+def cosine_similarity(vec1: list[float], vec2: list[float]) -> float:
+    if not vec1 or not vec2 or len(vec1) != len(vec2):
+        return 0.0
+    dot = sum(a * b for a, b in zip(vec1, vec2))
+    norm1 = math.sqrt(sum(a * a for a in vec1))
+    norm2 = math.sqrt(sum(b * b for b in vec2))
+    if norm1 == 0 or norm2 == 0:
+        return 0.0
+    return dot / (norm1 * norm2)
+
+def similar_titles(titles: list[str]) -> list[list[str]]:
+    if not titles:
+        return []
+
+    tokens_list = [set(tokenize(t)) for t in titles]
+    raw_titles = list(titles)
+    vocab = build_vocab(titles)
+    vectors = [title_to_tf_vector(t, vocab) for t in titles]
+
+    ungrouped = list(range(len(titles)))
+    groups = []
+
+    while ungrouped:
+        idx = ungrouped.pop(0)
+        current_group = [idx]
+        remaining = []
+        for cand_idx in ungrouped:
+            sim = similarity(tokens_list[idx], tokens_list[cand_idx])
+            if sim >= EQUAL:
+                current_group.append(cand_idx)
+            elif sim < NOT_EQUAL:
+                remaining.append(cand_idx)
+            else:
+                match = False
+                for g_idx in current_group:
+                    if cosine_similarity(vectors[cand_idx], vectors[g_idx]) >= SIMILARITY_THRESHOLD:
+                        match = True
+                        break
+                if match:
+                    current_group.append(cand_idx)
+                else:
+                    remaining.append(cand_idx)
+        groups.append([raw_titles[i] for i in current_group])
+        ungrouped = remaining
+
+    return groups
+
+def find_middle(group: list[str], vocab: dict[str, int]) -> str:
+    
+    if len(group) == 1:
+        return group[0]
+
+    # Векторизуем все заголовки в группе
+    vectors = [title_to_tf_vector(title, vocab) for title in group]
+    n = len(vectors)
+    best_avg_sim = -1.0
+    best_title = group[0]
+
+    for i in range(n):
+        total_sim = 0.0
+        count = 0
+        for j in range(n):
+            if i != j:
+                sim = cosine_similarity(vectors[i], vectors[j])
+                total_sim += sim
+                count += 1
+        avg_sim = total_sim / count if count > 0 else 0.0
+
+        if avg_sim > best_avg_sim:
+            best_avg_sim = avg_sim
+            best_title = group[i]
+
+    return best_title
+
+if __name__ == "__main__":
+    sample_titles = [
+        "Climate Change Is Accelerating, Scientists Warn",
+        "Scientists Warn: Climate Change Accelerates",
+        "New Study Shows Global Warming Speeds Up",
+        "The Impact of Rising Temperatures on Polar Ice",
+        "Rising Temperatures Melt Arctic Ice Faster",
+        "Stock Market Hits Record High After Fed Decision",
+        "Fed Decision Pushes Stocks to All-Time High",
+        "How to Cook Perfect Pasta — 5 Simple Steps",
+        "5 Easy Steps to Cook Perfect Pasta at Home",
+        "Pasta Cooking Guide: Tips and Tricks",
+    ]
+
+    groups = similar_titles(sample_titles)
+
+    vocab = build_vocab(sample_titles)
+
+    print("✅ Результат со средними заголовками:\n")
+    for i, group in enumerate(groups, 1):
+        mid = find_middle(group, vocab)
+        print(f"Group {i} (средний по смыслу: {mid!r}):")
+        for t in group:
+            marker = "  →" if t == mid else "   "
+            print(f"{marker} {t}")
+        print()
