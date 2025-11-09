@@ -1,0 +1,88 @@
+import re
+import string
+from collections import Counter
+
+# Попытка импорта pymorphy2 — если нет, работаем без лемматизации
+try:
+    import pymorphy2
+    MORPH = pymorphy2.MorphAnalyzer()
+    USE_MORPH = True
+except ImportError:
+    MORPH = None
+    USE_MORPH = False
+    print("⚠️  pymorphy2 не установлен. Нормализация русского будет без лемматизации.")
+
+def detect_language_and_normalize(text: str) -> tuple[str, str]:
+    """
+    Определяет язык текста и нормализует его, если это русский.
+    
+    Возвращает:
+        (language: str, normalized_text: str)
+        language — 'ru', 'en' или 'unknown'
+        normalized_text — очищенный и, при возможности, лемматизированный текст
+    """
+    if not text or not text.strip():
+        return "unknown", ""
+
+    # Убираем пробелы и знаки препинания для анализа
+    clean_text = re.sub(r'[^\w\s]', ' ', text.lower())
+    words = clean_text.split()
+
+    if not words:
+        return "unknown", ""
+
+    # Считаем долю кириллических и латинских букв
+    cyrillic_chars = sum(1 for c in text if '\u0400' <= c <= '\u04FF')
+    latin_chars = sum(1 for c in text if 'a' <= c.lower() <= 'z')
+
+    total_letters = cyrillic_chars + latin_chars
+    if total_letters == 0:
+        lang = "unknown"
+    elif cyrillic_chars > latin_chars:
+        lang = "ru"
+    else:
+        lang = "en"
+
+    # Нормализуем ТОЛЬКО если русский
+    if lang == "ru":
+        # Удаляем пунктуацию и приводим к нижнему регистру
+        normalized = re.sub(r'[^\w\s]', ' ', text.lower())
+        normalized = re.sub(r'\s+', ' ', normalized).strip()
+
+        words = normalized.split()
+        if USE_MORPH:
+            # Лемматизация через pymorphy2
+            lemmas = []
+            for word in words:
+                if word.isalpha():  # только буквенные слова
+                    parsed = MORPH.parse(word)[0]
+                    lemmas.append(parsed.normal_form)
+                else:
+                    lemmas.append(word)  # числа, аббревиатуры и т.д. оставляем
+            normalized = " ".join(lemmas)
+        else:
+            # Без лемматизации — просто слова в нижнем регистре
+            normalized = " ".join(words)
+    else:
+        # Для других языков — просто очистка (без лемматизации)
+        normalized = re.sub(r'[^\w\s]', ' ', text.lower())
+        normalized = re.sub(r'\s+', ' ', normalized).strip()
+
+    return lang, normalized
+
+
+# === Пример использования ===
+if __name__ == "__main__":
+    test_texts = [
+        "Привет! Как твои дела?",
+        "Я читаю интересные книги по машинному обучению.",
+        "Climate change is accelerating rapidly.",
+        "Сегодня 5-е ноября 2025 года.",
+        "Машинное обучение и нейросети — будущее!",
+        ""
+    ]
+
+    for text in test_texts:
+        lang, norm = detect_language_and_normalize(text)
+        print(f"Текст: {text!r}")
+        print(f"  Язык: {lang}, Нормализовано: {norm!r}\n")
