@@ -1,0 +1,32 @@
+{
+  "groups": [
+    {
+      "main_title": "Заголовок1",
+      "group": [
+        {
+          "title": "", 
+          "content": "",
+          "date": "",
+          "source": ""
+        },
+        {
+          "title": "",
+          "content": "",
+          "date": "",
+          "source": ""
+        }
+      ]
+    },
+    {
+      "main_title": "Заголовок2",
+      "articles": [
+        {
+          "title": "",
+          "content": "",
+          "date": "",
+          "source": ""
+        }
+      ]
+    }
+  ]
+}
