@@ -1,0 +1,61 @@
+1. Создать файл requiremensts.txt:
+
+Flask==3.0.3
+
+# так же добавить остальные зависимости 
+
+далее
+pip freeze > requirements.txt
+
+Dockerfile:
+
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt #установка зависимостей
+
+# Копируем код приложения
+COPY . .
+
+# Открываем порт 
+EXPOSE 5000
+
+# Запуск
+CMD ["python", "app.py"]
+
+далее:
+сборка образа:
+docker build -t my-flask-app
+
+запуск контейнера:
+docker run -p 5000:5000 my-flask-app
+(но чтобы бд сохранялась):
+
+docker run -p 5000:5000 -v $(pwd)//app/data my-flask-app
+
+
+доступ по адресу:
+http://localhost:5000
+
+
+--------------------------------------------------------------------------------
+с использованием venv:
+1) открыть терминал в папке проекта:
+python3 -m venv venv
+2) source venv/bin/activate # Активировать виртуальное окружение
+3) установить зависимости внутри виртуального окружения:
+pip install Flask
+# и другие зависимости, например:
+# pip install selenium
+4) пакеты с версиями в файле requirements.txt
+Flask==3.0.3
+Werkzeug==3.0.1
+...
+pip freeze > requirements.txt
+5) python app.py #в виртуальном окружении:
+deactivate
+
+перед запусками:
+source venv/bin/activate   # Linux/macOS
+venv\Scripts\activate      # Windows
+
