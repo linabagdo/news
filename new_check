@@ -1,0 +1,145 @@
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import re
+from collections import defaultdict, deque
+
+def clean_text(text):
+    text = text.lower()
+    text = re.sub(r'[^\w\sа-яё]', ' ', text, flags=re.IGNORECASE)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+russian_stopwords = [
+    'и', 'в', 'во', 'не', 'что', 'он', 'на', 'я', 'с', 'со', 'как', 'а', 'то', 'все', 'она', 'так',
+    'его', 'но', 'да', 'ты', 'к', 'у', 'же', 'вы', 'за', 'бы', 'по', 'только', 'ее', 'мне', 'было',
+    'вот', 'от', 'меня', 'еще', 'нет', 'о', 'из', 'ему', 'теперь', 'когда', 'даже', 'ну', 'вдруг',
+    'ли', 'если', 'уже', 'или', 'ни', 'быть', 'был', 'него', 'до', 'вас', 'нибудь', 'опять', 'уж',
+    'вам', 'сказал', 'ведь', 'там', 'потом', 'себя', 'ничего', 'ей', 'может', 'они', 'тут', 'где',
+    'есть', 'надо', 'ней', 'для', 'мы', 'тебя', 'их', 'чем', 'была', 'сам', 'чтоб', 'без', 'будто',
+    'человек', 'чего', 'раз', 'тоже', 'себе', 'под', 'жизнь', 'будет', 'ж', 'тогда', 'кто', 'этот',
+    'говорил', 'того', 'потому', 'этого', 'какой', 'совсем', 'ним', 'здесь', 'этом', 'один', 'почти',
+    'мой', 'тем', 'чтобы', 'нее', 'сейчас', 'были', 'куда', 'зачем', 'сказать', 'всех', 'никогда',
+    'сегодня', 'можно', 'при', 'наконец', 'два', 'об', 'другой', 'хоть', 'после', 'над', 'больше',
+    'тот', 'через', 'эти', 'нас', 'про', 'всего', 'них', 'какая', 'много', 'разве', 'сказала', 'три',
+    'эту', 'моя', 'впрочем', 'хорошо', 'свою', 'этой', 'перед', 'иногда', 'лучше', 'чуть', 'том', 'нельзя'
+]
+
+english_stopwords = [
+    'i', 'me', 'my', 'myself', 'we', 'our', 'ours', 'ourselves', 'you', "you're", "you've", "you'll", "you'd",
+    'your', 'yours', 'yourself', 'yourselves', 'he', 'him', 'his', 'himself', 'she', "she's", 'her', 'hers',
+    'herself', 'it', "it's", 'its', 'itself', 'they', 'them', 'their', 'theirs', 'themselves', 'what', 'which',
+    'who', 'whom', 'this', 'that', "that'll", 'these', 'those', 'am', 'is', 'are', 'was', 'were', 'be', 'been',
+    'being', 'have', 'has', 'had', 'having', 'do', 'does', 'did', 'doing', 'a', 'an', 'the', 'and', 'but', 'if',
+    'or', 'because', 'as', 'until', 'while', 'of', 'at', 'by', 'for', 'with', 'through', 'during', 'before',
+    'after', 'above', 'below', 'up', 'down', 'in', 'out', 'on', 'off', 'over', 'under', 'again', 'further',
+    'then', 'once', 'here', 'there', 'when', 'where', 'why', 'how', 'all', 'any', 'both', 'each', 'few', 'more',
+    'most', 'other', 'some', 'such', 'no', 'nor', 'not', 'only', 'own', 'same', 'so', 'than', 'too', 'very',
+    's', 't', 'can', 'will', 'just', 'don', "don't", 'should', "should've", 'now', 'd', 'll', 'm', 'o', 're',
+    've', 'y', 'ain', 'aren', "aren't", 'couldn', "couldn't", 'didn', "didn't", 'doesn', "doesn't", 'hadn',
+    "hadn't", 'hasn', "hasn't", 'haven', "haven't", 'isn', "isn't", 'ma', 'mightn', "mightn't", 'mustn',
+    "mustn't", 'needn', "needn't", 'shan', "shan't", 'shouldn', "shouldn't", 'wasn', "wasn't", 'weren',
+    "weren't", 'won', "won't", 'wouldn', "wouldn't"
+]
+
+multilingual_stopwords = russian_stopwords + english_stopwords
+
+def clean_text(text):
+    
+    text = text.lower()
+    text = re.sub(r'[^\w\sа-яёa-z]', ' ', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+
+# Стоп-слова как списки (уже исправлено!)
+russian_stopwords = [ ... ]  # твой список выше
+english_stopwords = [ ... ]
+multilingual_stopwords = list(set(russian_stopwords + english_stopwords))
+
+def clean_text(text):
+    text = text.lower()
+    text = re.sub(r'[^\w\sа-яёa-z]', ' ', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+def group_titles_connected(titles, threshold=0.55):
+    if not titles:
+        return []
+    
+    cleaned = [clean_text(t) for t in titles]
+    
+    vectorizer = TfidfVectorizer(
+        lowercase=False,
+        stop_words=multilingual_stopwords,
+        ngram_range=(1, 1),
+        max_features=10000,
+        token_pattern=r'(?u)\b\w{2,}\b'
+    )
+    vectors = vectorizer.fit_transform(cleaned)
+    
+    # Матрица схожести
+    sim_matrix = cosine_similarity(vectors)
+    
+    # Строим граф: adjacency list
+    n = len(titles)
+    graph = defaultdict(list)
+    for i in range(n):
+        for j in range(i + 1, n):
+            if sim_matrix[i, j] >= threshold:
+                graph[i].append(j)
+                graph[j].append(i)
+    
+    # Поиск связных компонент (BFS)
+    visited = [False] * n
+    groups = []
+    
+    for i in range(n):
+        if not visited[i]:
+            component = []
+            queue = deque([i])
+            visited[i] = True
+            while queue:
+                node = queue.popleft()
+                component.append(node)
+                for neighbor in graph[node]:
+                    if not visited[neighbor]:
+                        visited[neighbor] = True
+                        queue.append(neighbor)
+            groups.append(component)
+    
+    # Преобразуем индексы в тексты
+    return [[titles[idx] for idx in group] for group in groups]
+
+    
+    for idx, group_vectors in enumerate(vectors_per_group):
+        sims = cosine_similarity(new_vec, group_vectors).flatten()
+        max_sim = sims.max()
+        if max_sim >= threshold and max_sim > best_sim:
+            best_sim = max_sim
+            best_group = idx
+    
+    if best_group is not None:
+        # Добавляем в существующую группу
+        existing_groups[best_group].append(new_title)
+        vectors_per_group[best_group].append(new_vec)
+        return existing_groups, vectors_per_group, best_group
+    else:
+        # Создаём новую группу
+        existing_groups.append([new_title])
+        vectors_per_group.append([new_vec])
+        return existing_groups, vectors_per_group, len(existing_groups) - 1
+
+groups = ["Ангелина и даша",
+        "Даша и ангелина",
+        "New Study Shows Global Warming Speeds Up",
+        "The Impact of Rising Temperatures on Polar Ice",
+        "Rising Temperatures Melt Arctic Ice Faster",
+        "Stock Market Hits Record High After Fed Decision",
+        "Fed Decision Pushes Stocks to All-Time High",
+        "How to Cook Perfect Pasta — 5 Simple Steps",
+        "5 Easy Steps to Cook Perfect Pasta at Home",
+        "Pasta Cooking Guide: Tips and Tricks",]
+
+for i in (group_titles_connected(groups, 0.3)):
+    print(i)
