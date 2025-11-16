@@ -1,0 +1,5 @@
+from transliterate import translit
+
+
+text = translit("Привет", language_code='ru', reversed=True)
+print(text)
