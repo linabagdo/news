@@ -1,0 +1,242 @@
+✅ Сохранить функцию обратного вызова (callback) как есть
+✅ Добавить две lock-free очереди (freeQueue и filledQueue) с пулом буферов
+✅ Использовать флаг is_writing внутри callback'а для принятия решения о записи
+✅ При изменении is_writing с false → true или при достижении 256 МБ — создавать новый pcap-файл с именем по времени
+✅ Управление файлом — в потоке записи, чтобы не блокировать callback
+
+
+Callback (hot path):
+ проверяет is_writing_
+ если true — берёт буфер из freeQueue, копирует данные, кладёт в filledQueue
+Поток записи (background):
+ берёт буферы из filledQueue
+ пишет в текущий pcap-файл
+ следит за размером файла
+ если > 256 МБ → закрывает текущий, создаёт новый (с именем по времени)
+ также создаёт новый файл при старте записи (когда is_writing впервые становится true)
+Управление is_writing:
+Предполагается, что внешний код (например, UI или API) устанавливает is_writing = true/false.
+Мы реагируем на переходы false → true.
+
+1. Заголовки и структуры
+#include <vector>
+#include <atomic>
+#include <thread>
+#include <chrono>
+#include <cstdint>
+#include <string>
+#include <iomanip>
+#include <sstream>
+#include <pcap.h> // или твоя библиотека для записи pcap
+#include "concurrentqueue.h"
+
+struct PacketBuffer {
+    static const size_t MAX_PACKET_SIZE = 65536;
+    std::array<uint8_t, MAX_PACKET_SIZE> data;
+    size_t len = 0;
+    std::chrono::microseconds timestamp_us; // libpcap использует микросекунды
+
+    void reset() { len = 0; }
+};
+
+using BufferPtr = PacketBuffer*;
+
+2. Класс RoatingPcapWriter
+class RotatingPcapWriter {
+public:
+    RotatingPcapWriter(size_t poolSize = 20000);
+    ~RotatingPcapWriter();
+
+    // Внешний код вызывает это, чтобы включить/выключить запись
+    void setIsWriting(bool enable);
+
+    // Вызывается из callback'а!
+    void onPacketReceived(const uint8_t* data, size_t len);
+
+    // Получить текущий флаг (если нужно)
+    [[nodiscard]] bool isWriting() const noexcept {
+        return is_writing_.load(std::memory_order_relaxed);
+    }
+
+private:
+    void writerThread();
+    std::string generateFilename();
+    void openNewFile();
+    void closeCurrentFile();
+
+    // Настройки
+    static const int64_t MAX_FILE_SIZE_BYTES = 256LL * 1024 * 1024; // 256 МБ
+    size_t poolSize_;
+
+    // Пул буферов
+    std::vector<PacketBuffer> bufferPool_;
+    moodycamel::ConcurrentQueue<BufferPtr> freeQueue_;
+    moodycamel::ConcurrentQueue<BufferPtr> filledQueue_;
+
+    // Флаг записи
+    std::atomic<bool> is_writing_{false};
+    std::atomic<bool> shouldStop_{false};
+
+    // Управление файлом (всё — только в потоке записи!)
+    pcap_t* pcap_handle_ = nullptr;
+    pcap_dumper_t* dumper_ = nullptr;
+    int64_t currentFileSize_ = 0;
+    bool fileOpenedSinceLastStart_ = false;
+
+    std::thread writerThread_;
+};
+3. Реализация методов
+   конструктор/деструктор
+RotatingPcapWriter::RotatingPcapWriter(size_t poolSize)
+    : poolSize_(poolSize), bufferPool_(poolSize) {
+    for (auto& buf : bufferPool_) {
+        freeQueue_.enqueue(&buf);
+    }
+    shouldStop_.store(false, std::memory_order_relaxed);
+    writerThread_ = std::thread(&RotatingPcapWriter::writerThread, this);
+}
+
+RotatingPcapWriter::~RotatingPcapWriter() {
+    shouldStop_.store(true, std::memory_order_relaxed);
+    if (writerThread_.joinable()) {
+        writerThread_.join();
+    }
+    closeCurrentFile();
+}
+     управление флагом записи
+void RotatingPcapWriter::setIsWriting(bool enable) {
+    if (enable == is_writing_.load(std::memory_order_relaxed)) return;
+
+    is_writing_.store(enable, std::memory_order_relaxed);
+
+    // Если включаем запись — сбросим флаг открытия файла
+    if (enable) {
+        fileOpenedSinceLastStart_ = false;
+    }
+}
+в Call
+void RotatingPcapWriter::onPacketReceived(const uint8_t* data, size_t len) {
+    if (!is_writing_.load(std::memory_order_relaxed)) return;
+    if (len > PacketBuffer::MAX_PACKET_SIZE) return;
+
+    BufferPtr buf = nullptr;
+    if (!freeQueue_.try_dequeue(buf)) {
+        return; // отбрасываем, если нет свободных буферов
+    }
+
+    // Заполняем
+    buf->len = len;
+    auto now = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()
+    );
+    buf->timestamp_us = now;
+    std::memcpy(buf->data.data(), data, len);
+
+    filledQueue_.enqueue(buf);
+}
+поток записи
+void RotatingPcapWriter::writerThread() {
+    BufferPtr buf = nullptr;
+
+    while (!shouldStop_.load(std::memory_order_relaxed)) {
+        if (filledQueue_.try_dequeue(buf)) {
+            // Проверяем: нужно ли открыть файл?
+            if (is_writing_.load(std::memory_order_relaxed) && !fileOpenedSinceLastStart_) {
+                closeCurrentFile();
+                openNewFile();
+                fileOpenedSinceLastStart_ = true;
+                currentFileSize_ = 0;
+            }
+
+            // Пишем, только если файл открыт
+            if (dumper_) {
+                struct pcap_pkthdr hdr;
+                hdr.ts.tv_sec = static_cast<long>(buf->timestamp_us.count() / 1'000'000);
+                hdr.ts.tv_usec = static_cast<long>(buf->timestamp_us.count() % 1'000'000);
+                hdr.caplen = hdr.len = buf->len;
+
+                pcap_dump((u_char*)dumper_, &hdr, buf->data.data());
+                currentFileSize_ += sizeof(pcap_pkthdr) + buf->len;
+
+                // Проверка на переполнение
+                if (currentFileSize_ >= MAX_FILE_SIZE_BYTES) {
+                    closeCurrentFile();
+                    fileOpenedSinceLastStart_ = false; // чтобы открыть новый при след. пакете
+                }
+            }
+
+            // Возврат в пул
+            buf->reset();
+            freeZone_.enqueue(buf);
+        } else {
+            std::this_thread::sleep_for(std::chrono::microseconds(10));
+        }
+    }
+
+    // Очистка остатков (опционально)
+    while (filledQueue_.try_dequeue(buf)) {
+        if (dumper_) {
+            // записать...
+            buf->reset();
+            freeQueue_.enqueue(buf);
+        }
+    }
+    closeCurrentFile();
+}
+ работа с файлами
+std::string RotatingPcapWriter::generateFilename() {
+    auto now = std::chrono::system_clock::now();
+    auto time_t = std::chrono::system_clock::to_time_t(now);
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
+
+    std::stringstream ss;
+    ss << std::put_time(std::localtime(&time_t), "%Y%m%d_%H%M%S");
+    ss << '_' << std::setfill('0') << std::setw(3) << ms.count();
+    ss << ".pcap";
+    return ss.str();
+}
+
+void RotatingPcapWriter::openNewFile() {
+    closeCurrentFile();
+
+    std::string filename = generateFilename();
+    pcap_handle_ = pcap_open_dead(DLT_EN10MB, 65535);
+    if (!pcap_handle_) return;
+
+    dumper_ = pcap_dump_open(pcap_handle_, filename.c_str());
+    if (!dumper_) {
+        pcap_close(pcap_handle_);
+        pcap_handle_ = nullptr;
+    }
+}
+
+void RotatingPcapWriter::closeCurrentFile() {
+    if (dumper_) {
+        pcap_dump_close(dumper_);
+        dumper_ = nullptr;
+    }
+    if (pcap_handle_) {
+        pcap_close(pcap_handle_);
+        pcap_handle_ = nullptr;
+    }
+}
+4. использование
+// Глобальный объект
+RotatingPcapWriter g_pcapWriter;
+
+// В callback'е (остаётся почти без изменений!)
+void my_packet_callback(const uint8_t* data, size_t len) {
+    // Твоя логика обработки...
+    
+    // А запись — делегируем
+    g_pcapWriter.onPacketReceived(data, len);
+}
+
+// Где-то в UI / API:
+void startCapture() {
+    g_pcapWriter.setIsWriting(true);
+}
+
+void stopCapture() {
+    g_pcapWriter.setIsWriting(false);
+}
