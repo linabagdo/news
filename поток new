@@ -1,0 +1,192 @@
+#include <vector>
+#include <thread>
+#include <atomic>
+#include <chrono>
+#include <fstream>
+#include <sstream>
+#include <iomanip>
+#include <cstdint>
+#include "concurrentqueue.h"
+
+static const size_t CELL_SIZE = 65536;      // размер одной ячейки
+static const size_t CELL_COUNT = 1024;      // количество ячеек
+static const size_t BUFFER_SIZE = CELL_SIZE * CELL_COUNT;
+
+using CellPtr = uint8_t*; // указатель на начало ячейки
+
+
+
+
+
+
+
+
+класс
+class RingPcapWriter {
+public:
+    RingPcapWriter() : buffer_(new uint8_t[BUFFER_SIZE]), shouldStop_(false) {
+        // Инициализация: все ячейки — свободны
+        for (size_t i = 0; i < CELL_COUNT; ++i) {
+            CellPtr cell = buffer_ + i * CELL_SIZE;
+            freeQueue_.enqueue(cell);
+        }
+        writerThread_ = std::thread(&RingPcapWriter::writerThread, this);
+    }
+
+    ~RingPcapWriter() {
+        shouldStop_.store(true);
+        if (writerThread_.joinable()) {
+            writerThread_.join();
+        }
+        delete[] buffer_;
+    }
+
+    void setIsWriting(bool enable) {
+        if (enable == isWriting_.load()) return;
+        isWriting_.store(enable);
+        if (enable) {
+            createNewFile_.store(true);
+        }
+    }
+
+    void onPacketReceived(const uint8_t* data, size_t len) {
+        if (!isWriting_.load() || len > CELL_SIZE - sizeof(PacketHeader)) return;
+
+        CellPtr cell = nullptr;
+        if (!freeQueue_.try_dequeue(cell)) {
+            return; // отбрасываем, если все ячейки заняты
+        }
+
+        // Добавим небольшой заголовок: длина и время
+        PacketHeader* hdr = reinterpret_cast<PacketHeader*>(cell);
+        hdr->len = static_cast<uint32_t>(len);
+        hdr->timestamp_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::system_clock::now().time_since_epoch()
+        ).count();
+
+        // Данные — сразу после заголовка
+        uint8_t* payload = cell + sizeof(PacketHeader);
+        std::memcpy(payload, data, len);
+
+        filledQueue_.enqueue(cell);
+    }
+
+private:
+    struct PacketHeader {
+        int64_t timestamp_us;
+        uint32_t len;
+        // padding не нужен — компилятор сам выровняет
+    };
+
+    void writerThread() {
+        CellPtr cell = nullptr;
+
+        while (!shouldStop_.load()) {
+            if (filledQueue_.try_dequeue(cell)) {
+                if (createNewFile_.load()) {
+                    closeFile();
+                    openNewFile();
+                    currentFileSize_ = 24; // pcap global header
+                    createNewFile_.store(false);
+                }
+
+                if (outputFile_.is_open()) {
+                    PacketHeader* hdr = reinterpret_cast<PacketHeader*>(cell);
+                    uint8_t* payload = cell + sizeof(PacketHeader);
+
+                    // Запись в pcap-формате
+                    uint32_t ts_sec  = static_cast<uint32_t>(hdr->timestamp_us / 1'000'000);
+                    uint32_t ts_usec = static_cast<uint32_t>(hdr->timestamp_us % 1'000'000);
+                    uint32_t incl_len = hdr->len;
+                    uint32_t orig_len = incl_len;
+
+                    outputFile_.write(reinterpret_cast<const char*>(&ts_sec), 4);
+                    outputFile_.write(reinterpret_cast<const char*>(&ts_usec), 4);
+                    outputFile_.write(reinterpret_cast<const char*>(&incl_len), 4);
+                    outputFile_.write(reinterpret_cast<const char*>(&orig_len), 4);
+                    outputFile_.write(reinterpret_cast<const char*>(payload), incl_len);
+
+                    currentFileSize_ += 16 + incl_len;
+
+                    if (currentFileSize_ >= 256LL * 1024 * 1024) {
+                        createNewFile_.store(true);
+                    }
+                }
+
+                // Возврат ячейки в пул
+                freeQueue_.enqueue(cell);
+            } else {
+                std::this_thread::sleep_for(std::chrono::microseconds(50));
+            }
+        }
+
+        // Очистка
+        while (filledQueue_.try_dequeue(cell)) {
+            freeQueue_.enqueue(cell);
+        }
+        closeFile();
+    }
+
+    std::string generateFilename() {
+        auto now = std::chrono::system_clock::now();
+        auto time_t = std::chrono::system_clock::to_time_t(now);
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
+        std::stringstream ss;
+        ss << std::put_time(std::localtime(&time_t), "%Y%m%d_%H%M%S");
+        ss << '_' << std::setfill('0') << std::setw(3) << ms.count() << ".pcap";
+        return ss.str();
+    }
+
+    void openNewFile() {
+        closeFile();
+        std::string fname = generateFilename();
+        outputFile_.open(fname, std::ios::binary);
+        if (!outputFile_) return;
+
+        uint32_t magic = 0xa1b2c3d4;
+        uint16_t major = 2, minor = 4;
+        int32_t zone = 0;
+        uint32_t sigfigs = 0, snaplen = 65535, network = 1;
+        outputFile_.write(reinterpret_cast<const char*>(&magic), 4);
+        outputFile_.write(reinterpret_cast<const char*>(&major), 2);
+        outputFile_.write(reinterpret_cast<const char*>(&minor), 2);
+        outputFile_.write(reinterpret_cast<const char*>(&zone), 4);
+        outputFile_.write(reinterpret_cast<const char*>(&sigfigs), 4);
+        outputFile_.write(reinterpret_cast<const char*>(&snaplen), 4);
+        outputFile_.write(reinterpret_cast<const char*>(&network), 4);
+    }
+
+    void closeFile() {
+        if (outputFile_.is_open()) {
+            outputFile_.close();
+        }
+    }
+
+    // Один большой буфер
+    uint8_t* buffer_; // размер: CELL_COUNT * CELL_SIZE
+
+    // Очереди указателей на ячейки
+    moodycamel::ConcurrentQueue<CellPtr> freeQueue_;
+    moodycamel::ConcurrentQueue<CellPtr> filledQueue_;
+
+    // Файловый вывод
+    std::ofstream outputFile_;
+    std::atomic<int64_t> currentFileSize_{0};
+    std::atomic<bool> createNewFile_{false};
+    std::atomic<bool> isWriting_{false};
+    std::atomic<bool> shouldStop_{false};
+    std::thread writerThread_;
+};
+
+
+
+использование
+RingPcapWriter g_writer;
+
+void my_callback(const uint8_t* data, size_t len) {
+    g_writer.onPacketReceived(data, len);
+}
+
+// Управление:
+g_writer.setIsWriting(true);  // → новый файл
+
