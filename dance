@@ -1,0 +1,183 @@
+import sys
+import math
+from shapely.geometry import Polygon, Point
+from pyproj import Transformer
+
+# ==============================================================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ==============================================================================
+
+def create_local_metric_transformer(lat_origin, lon_origin):
+    """Создаёт трансформер для перевода координат в метры"""
+    transformer = Transformer.from_crs(
+        "EPSG:4326",
+        f"+proj=aeqd +lat_0={lat_origin} +lon_0={lon_origin} +datum=WGS84 +units=m +no_defs",
+        always_xy=True
+    )
+    return transformer
+
+def transform_coords(transformer, coords, inverse=False):
+    """Трансформирует координаты [lat, lon] <-> [x, y]"""
+    if not coords:
+        return []
+    lats = [c[0] for c in coords]
+    lons = [c[1] for c in coords]
+    if inverse:
+        new_lons, new_lats = transformer.transform(lons, lats, direction='INVERSE')
+    else:
+        new_lons, new_lats = transformer.transform(lons, lats, direction='FORWARD')
+    return list(zip(new_lats, new_lons))
+
+def calculate_point_weight(poly_area_m2, count, intersection_ratio):
+    """Рассчитывает вес точки на основе площади, count и пересечения"""
+    if poly_area_m2 > 0:
+        area_weight = 10000.0 / (poly_area_m2 + 1.0)
+    else:
+        area_weight = 10000.0
+    area_weight = min(100.0, area_weight)
+    
+    count_weight = count * 20.0
+    count_weight = min(100.0, count_weight)
+    
+    intersection_weight = intersection_ratio * 50.0
+    
+    return area_weight + count_weight + intersection_weight
+
+def calculate_confidence(weight, intersection_ratio, step):
+    """Рассчитывает вероятность нахождения точки в процентах"""
+    base_conf = min(60.0, weight * 0.5)
+    intersection_bonus = intersection_ratio * 30.0
+    if step == 0:
+        intersection_bonus = 20.0
+    confidence = base_conf + intersection_bonus
+    return max(0.0, min(100.0, confidence))
+
+# ==============================================================================
+# ОСНОВНАЯ ЛОГИКА
+# ==============================================================================
+
+def process_trajectory_with_filtering(points, polygons, counts):
+    """
+    Обрабатывает траекторию с РАСЧЁТОМ результирующей позиции.
+    points: [[lat, lon], [lat, lon]...]
+    polygons: [[[lat, lon], [lat, lon]...], [[lat, lon]...]]
+    counts: [int, int, int...]
+    """
+    if not (len(points) == len(polygons) == len(counts)):
+        raise ValueError("Длины массивов должны совпадать!")
+    
+    if len(points) == 0:
+        print("Нет данных для обработки.")
+        return
+
+    # Инициализация проекции
+    start_lat, start_lon = points[0]
+    transformer = create_local_metric_transformer(start_lat, start_lon)
+    
+    prev_result_m = None
+    prev_polygon_m = None
+    prev_weight = 0.0
+    
+    print(f"{'Шаг':<5} | {'Широта':<12} | {'Долгота':<12} | {'Вероятность %':<15} | {'Вес':<8} | {'Комментарий'}")
+    print("-" * 95)
+
+    for step, (pt, poly_coords, count) in enumerate(zip(points, polygons, counts)):
+        try:
+            # 1. Трансформация в метры
+            pt_m = transform_coords(transformer, [pt])[0]
+            current_point_m = Point(pt_m[0], pt_m[1])
+            
+            # 2. Создаём полигон из списка координат (твоя структура)
+            poly_coords_m = transform_coords(transformer, poly_coords)
+            current_polygon_m = Polygon(poly_coords_m)
+            area_m2 = current_polygon_m.area
+            
+            # 3. Расчёт пересечения
+            intersection_ratio = 0.0
+            if prev_polygon_m is not None:
+                intersection = current_polygon_m.intersection(prev_polygon_m)
+                if not intersection.is_empty and area_m2 > 0:
+                    intersection_ratio = intersection.area / area_m2
+            
+            # 4. Расчёт веса
+            current_weight = calculate_point_weight(area_m2, count, intersection_ratio)
+            
+            # 5. === РАСЧЁТ РЕЗУЛЬТИРУЮЩЕЙ ПОЗИЦИИ ===
+            if prev_result_m is None:
+                result_m = current_point_m
+            else:
+                total_weight = current_weight + prev_weight
+                if total_weight > 0:
+                    current_coef = current_weight / total_weight
+                    prev_coef = prev_weight / total_weight
+                    result_x = current_point_m.x * current_coef + prev_result_m.x * prev_coef
+                    result_y = current_point_m.y * current_coef + prev_result_m.y * prev_coef
+                    result_m = Point(result_x, result_y)
+                else:
+                    result_m = current_point_m
+            
+            # 6. Обратная трансформация в градусы
+            res_lat, res_lon = transform_coords(transformer, [(result_m.y, result_m.x)], inverse=True)[0]
+            
+            # 7. Расчёт вероятности
+            probability = calculate_confidence(current_weight, intersection_ratio, step)
+            
+            # 8. Комментарий
+            comment = ""
+            if step == 0:
+                comment = "Старт"
+            elif intersection_ratio > 0.5:
+                comment = "Стабильно"
+            elif intersection_ratio > 0.1:
+                comment = "Движение"
+            else:
+                comment = "Скачок"
+            
+            # 9. Вывод
+            print(f"{step:<5} | {res_lat:<12.6f} | {res_lon:<12.6f} | {probability:<15.2f} | {current_weight:<8.2f} | {comment}")
+            
+            # 10. Сохранение состояния
+            prev_result_m = result_m
+            prev_polygon_m = current_polygon_m
+            prev_weight = current_weight
+            
+        except Exception as e:
+            print(f"Ошибка на шаге {step}: {e}")
+            continue
+
+    print("-" * 95)
+    print("Обработка завершена.")
+
+# ==============================================================================
+# ПРИМЕР ИСПОЛЬЗОВАНИЯ (ТВОЯ СТРУКТУРА)
+# ==============================================================================
+
+if __name__ == "__main__":
+    # 1. Массив точек (центры)
+    input_points = [
+        [11.0, 11.0],
+        [11.5, 11.5],
+        [12.0, 12.0],
+        [15.0, 15.0],  # Скачок
+        [15.2, 15.2],
+    ]
+    
+    # 2. Массив полигонов (твоя структура: список списков координат)
+    # ВАЖНО: Запятые между полигонами обязательны!
+    input_polygons = [
+        [[10.9, 10.9], [10.9, 11.1], [11.1, 11.1], [11.1, 10.9]],  # Полигон 1
+        [[11.4, 11.4], [11.4, 11.6], [11.6, 11.6], [11.6, 11.4]],  # Полигон 2
+        [[11.8, 11.8], [11.8, 12.2], [12.2, 12.2], [12.2, 11.8]],  # Полигон 3 (больше)
+        [[14.9, 14.9], [14.9, 15.1], [15.1, 15.1], [15.1, 14.9]],  # Полигон 4
+        [[15.1, 15.1], [15.1, 15.3], [15.3, 15.3], [15.3, 15.1]],  # Полигон 5
+    ]
+    
+    # 3. Массив count
+    input_counts = [1, 3, 2, 1, 5]
+
+    print("=== ОБРАБОТКА ТРАЕКТОРИИ ===\n")
+    try:
+        process_trajectory_with_filtering(input_points, input_polygons, input_counts)
+    except Exception as e:
+        print(f"Критическая ошибка: {e}")
+        print("Установите: pip install shapely pyproj")
