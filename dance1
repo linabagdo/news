@@ -1,0 +1,207 @@
+import sys
+import math
+from shapely.geometry import Polygon, Point
+from pyproj import Transformer
+
+# ==============================================================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ==============================================================================
+
+def get_local_transformer(lat_origin, lon_origin):
+    """
+    Создает трансформер в локальную метрическую проекцию (AEQD).
+    Центр проекции ставится в центр первого полигона для минимизации искажений.
+    """
+    transformer = Transformer.from_crs(
+        "EPSG:4326",
+        f"+proj=aeqd +lat_0={lat_origin} +lon_0={lon_origin} +datum=WGS84 +units=m +no_defs",
+        always_xy=True
+    )
+    return transformer
+
+def to_meters(transformer, lat, lon):
+    """Переводит (lat, lon) -> (x, y) в метрах"""
+    x, y = transformer.transform(lon, lat, direction='FORWARD')
+    return x, y
+
+def to_degrees(transformer, x, y):
+    """Переводит (x, y) в метрах -> (lat, lon)"""
+    lon, lat = transformer.transform(x, y, direction='INVERSE')
+    return lat, lon
+
+def get_polygon_centroid_m(poly_m):
+    """Безопасное получение центроида полигона в метрах"""
+    if poly_m.is_empty:
+        return None
+    centroid = poly_m.centroid
+    return centroid.x, centroid.y
+
+# ==============================================================================
+# ОСНОВНАЯ ЛОГИКА
+# ==============================================================================
+
+def process_polygons_trajectory(polygons_deg, counts):
+    """
+    Обрабатывает траекторию, используя ТОЛЬКО полигоны и counts.
+    polygons_deg: [[[lat, lon], ...], ...] - список полигонов в градусах
+    counts: [int, int, ...] - веса наблюдений
+    """
+    if len(polygons_deg) != len(counts):
+        raise ValueError("Длины массивов полигонов и counts должны совпадать!")
+    
+    if len(polygons_deg) == 0:
+        print("Нет данных для обработки.")
+        return
+
+    # 1. Инициализация проекции по центру первого полигона
+    # Находим примерный центр первого полигона для настройки проекции
+    first_poly_coords = polygons_deg[0]
+    lats = [p[0] for p in first_poly_coords]
+    lons = [p[1] for p in first_poly_coords]
+    origin_lat = sum(lats) / len(lats)
+    origin_lon = sum(lons) / len(lons)
+    
+    transformer = get_local_transformer(origin_lat, origin_lon)
+    
+    # Переменные состояния
+    prev_estimated_pos_m = None      # (x, y) - расчетная позиция
+    prev_polygon_m = None            # Polygon - полигон предыдущего шага (для проверки пересечения)
+    accumulated_confidence = 0.0     # Накопленная уверенность в предыдущей позиции
+    
+    # Коэффициенты фильтра
+    HISTORY_DECAY = 0.85  # Насколько быстро забываем старую историю (0.0 - мгновенно, 1.0 - никогда)
+    
+    print(f"{'Шаг':<5} | {'Широта':<12} | {'Долгота':<12} | {'Уверенность':<12} | {'Пересеч.':<10} | {'Комментарий'}")
+    print("-" * 95)
+
+    for step, (poly_coords, count) in enumerate(zip(polygons_deg, counts)):
+        try:
+            # 1. Трансформация текущего полигона в метры
+            # Shapely ожидает порядок (x, y), то есть (lon, lat) для проекций, 
+            # но наши входные данные [lat, lon].
+            xy_coords = [(to_meters(transformer, p[0], p[1])) for p in poly_coords]
+            current_poly_m = Polygon(xy_coords)
+            
+            if current_poly_m.area == 0:
+                # Вырожденный полигон, пропускаем или берем точку
+                current_centroid_m = to_meters(transformer, poly_coords[0][0], poly_coords[0][1])
+            else:
+                current_centroid_m = get_polygon_centroid_m(current_poly_m)
+            
+            if current_centroid_m is None:
+                continue
+
+            # 2. Расчет пересечения с ПРЕДЫДУЩИМ полигоном (геометрическая согласованность)
+            intersection_ratio = 0.0
+            if prev_polygon_m is not None and current_poly_m.area > 0:
+                intersection = current_poly_m.intersection(prev_polygon_m)
+                if not intersection.is_empty:
+                    # Отношение площади пересечения к площади текущего (насколько мы "внутри" прошлого)
+                    intersection_ratio = intersection.area / current_poly_m.area
+            
+            # 3. АДАПТИВНЫЙ РАСЧЕТ ВЕСОВ
+            # Базовый вес от count
+            current_weight_base = float(count)
+            
+            # Вес истории (накопленная уверенность)
+            history_weight_base = accumulated_confidence
+            
+            # Корректировка весов в зависимости от пересечения (движение или стабильность)
+            if intersection_ratio > 0.4:
+                # СТАБИЛЬНОСТЬ: Полигоны сильно пересекаются. 
+                # Цель скорее всего на месте. Доверяем истории больше, сглаживаем шум.
+                history_multiplier = 1.5
+                current_multiplier = 1.0
+                comment = "Стабильно"
+            elif intersection_ratio < 0.1:
+                # СКАЧОК: Пересечения почти нет. 
+                # Цель двигается. Доверяем новому измерению больше, историю обнуляем быстрее.
+                history_multiplier = 0.3
+                current_multiplier = 2.0
+                comment = "Движение/Скачок"
+            else:
+                # ПЛАВНОЕ ДВИЖЕНИЕ
+                history_multiplier = 1.0
+                current_multiplier = 1.0
+                comment = "Движение"
+
+            current_weight = current_weight_base * current_multiplier
+            history_weight = history_weight_base * history_multiplier
+
+            # 4. РАСЧЕТ НОВОЙ ПОЗИЦИИ (Взвешенный центр)
+            if prev_estimated_pos_m is None:
+                # Первый шаг - просто центр первого полигона
+                result_x, result_y = current_centroid_m
+            else:
+                total_weight = current_weight + history_weight
+                if total_weight > 0:
+                    coef_curr = current_weight / total_weight
+                    coef_hist = history_weight / total_weight
+                    
+                    result_x = current_centroid_m[0] * coef_curr + prev_estimated_pos_m[0] * coef_hist
+                    result_y = current_centroid_m[1] * coef_curr + prev_estimated_pos_m[1] * coef_hist
+                else:
+                    result_x, result_y = current_centroid_m
+
+            # 5. Обратная трансформация в градусы
+            res_lat, res_lon = to_degrees(transformer, result_x, result_y)
+            
+            # 6. Обновление состояния
+            # Обновляем накопленную уверенность (с учетом затухания истории)
+            accumulated_confidence = (accumulated_confidence * HISTORY_DECAY) + current_weight_base
+            
+            prev_estimated_pos_m = (result_x, result_y)
+            prev_polygon_m = current_poly_m
+            
+            # 7. Расчет условной "уверенности" для вывода (0-100%)
+            # Зависит от веса и пересечения
+            confidence_score = min(100.0, (accumulated_confidence / 10.0) * 20.0 + (intersection_ratio * 30.0))
+            if step == 0: confidence_score = 50.0 # На старте средняя
+
+            # 8. Вывод
+            print(f"{step:<5} | {res_lat:<12.6f} | {res_lon:<12.6f} | {confidence_score:<12.1f} | {intersection_ratio:<10.2f} | {comment}")
+            
+        except Exception as e:
+            print(f"Ошибка на шаге {step}: {e}")
+            continue
+
+    print("-" * 95)
+    print("Обработка завершена.")
+
+# ==============================================================================
+# ПРИМЕР ИСПОЛЬЗОВАНИЯ
+# ==============================================================================
+
+if __name__ == "__main__":
+    # 1. Массив полигонов (эллипсы погрешности)
+    # Структура: список полигонов, каждый полигон - список точек [lat, lon]
+    input_polygons = [
+        [[11.0, 11.0], [11.0, 11.2], [11.2, 11.2], [11.2, 11.0]],  # Полигон 1
+        [[11.05, 11.05], [11.05, 11.25], [11.25, 11.25], [11.25, 11.05]], # Полигон 2 (пересекается с 1)
+        [[11.1, 11.1], [11.1, 11.3], [11.3, 11.3], [11.3, 11.1]],  # Полигон 3 (пересекается с 2)
+        [[15.0, 15.0], [15.0, 15.2], [15.2, 15.2], [15.2, 15.0]],  # Полигон 4 (СКАЧОК, нет пересечения)
+        [[15.05, 15.05], [15.05, 15.25], [15.25, 15.25], [15.25, 15.05]], # Полигон 5 (стабилизация на новом месте)
+    ]
+    
+    # 2. Массив count (сколько раз встречался этот эллипс/наблюдение)
+    input_counts = [1, 3, 2, 1, 5]
+
+    print("=== ОБРАБОТКА ТРАЕКТОРИИ (ТОЛЬКО ПОЛИГОНЫ) ===\n")
+    try:
+        process_polygons_trajectory(input_polygons, input_counts)
+    except Exception as e:
+        print(f"Критическая ошибка: {e}")
+        print("Установите зависимости: pip install shapely pyproj")
+
+
+
+
+          алгоритм адаптивного взвешенного центроида.
+Что изменено и улучшено:
+Убран input_points: Позиция рассчитывается исключительно на основе полигонов.
+Исправлена работа с координатами: В оригинале была путаница между (Lat, Lon) и (X, Y) для Shapely, что могло искажать площади. Теперь четко: градусы -> (Lat, Lon), метры -> (X, Y).
+Адаптивный фильтр:
+Если полигоны пересекаются сильно (цель стоит на месте) -> Мы больше доверяем истории (сглаживаем шум).
+Если полигоны не пересекаются (цель прыгнула/двигается) -> Мы больше доверяем новому полигону (быстро реагируем).
+Вес count напрямую влияет на доверие к текущему измерению.
+Затухание истории: Накопленный вес предыдущих шагов немного уменьшается со временем, чтобы старые данные не «забивали» новое положение при движении.
