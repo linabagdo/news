@@ -1,0 +1,168 @@
+Опечатки в именах модулей и переменных
+anible.builtin → должно быть ansible.builtin.
+{{ancible_user}} → должно быть {{ansible_user}}.
+{{scp compose_result...}} → пробел в имени переменной, должно быть {{scp_compose_result...}}.
+copy_archive_result регистрируется дважды, а проверяется copy_compose_result (которого не существует).
+Неверный параметр в модуле copy
+У модуля ansible.builtin.copy нет параметра name. Это вызывает ошибку выполнения.
+Проблема с правами и путями (Почему файлов нет)
+Вы используете become: yes (root) во всех задачах.
+Сценарий: Когда Ansible копирует файл с become: yes, он часто помещает его во временную папку root, а затем перемещает. Если папка /home/user принадлежит пользователю user, а не root, или если у root нет прав на запись туда, файл может не появиться там, где вы ожидаете.
+SCP от имени пользователя: В задачах scp вы обращаетесь к файлам от имени {{seed_user}}@{{seed_host}}. Если файл лежит с правами root, пользователь user не сможет его прочитать для отправки.
+Логика delegate_to и SSH
+Вы запускаете scp с delegate_to: seed. Это значит, что команда выполняется на сервере seed.
+Сервер seed должен уметь подключаться по паролю к серверам targets. Убедитесь, что на seed установлен sshpass и он может видеть хосты targets.
+Синтаксические ошибки
+rc= == 0 (лишний знак).
+Пропущена кавычка в chdir: "{{compose_dir}}.
+
+
+# deploy_bakery.yml
+- name: Copy archive and docker-compose.yml to seed server
+  hosts: seed
+  become: yes
+  become_method: sudo
+  vars:
+    dest_user: "user"
+    dest_home: "/home/user"
+  tasks:
+    - name: Install sshpass on seed (required for password-based SCP)
+      ansible.builtin.apt:
+        name: sshpass
+        state: present
+        update_cache: yes
+      ignore_errors: yes
+
+    - name: Ensure destination directory exists
+      ansible.builtin.file:
+        path: "{{ dest_home }}"
+        state: directory
+        owner: "{{ dest_user }}"
+        group: "{{ dest_user }}"
+        mode: '0755'
+
+    - name: Copy archive from control node to seed
+      ansible.builtin.copy:
+        src: bakery_web_2.0.6.tar
+        dest: "{{ dest_home }}/bakery_web_2.0.6.tar"
+        owner: "{{ dest_user }}"
+        group: "{{ dest_user }}"
+        mode: '0644'
+      register: copy_archive_result
+
+    - name: Copy docker-compose.yml from control node to seed
+      ansible.builtin.copy:
+        src: docker-compose-2-0-6.yml
+        dest: "{{ dest_home }}/docker-compose-2-0-6.yml"
+        owner: "{{ dest_user }}"
+        group: "{{ dest_user }}"
+        mode: '0644'
+      register: copy_compose_result
+
+    - name: Copy config file from control node to seed
+      ansible.builtin.copy:
+        src: config_bakery_web_2.0.6.yaml
+        dest: "{{ dest_home }}/config_bakery_web_2.0.6.yaml"
+        owner: "{{ dest_user }}"
+        group: "{{ dest_user }}"
+        mode: '0644'
+      register: copy_config_result
+
+    - name: Ensure all copies to seed were successful
+      ansible.builtin.fail:
+        msg: "Failed to copy files to seed server"
+      when: >
+        copy_archive_result.failed or
+        copy_compose_result.failed or
+        copy_config_result.failed
+
+- name: Distribute archive from seed to all targets and deploy
+  hosts: targets
+  gather_facts: no
+  become: yes
+  become_method: sudo
+  vars:
+    seed_host: "{{ groups['seed'][0] }}"
+    seed_user: "user"
+    compose_dir: "/home/box/bakery"
+  tasks:
+    - name: Ensure target directory exists
+      ansible.builtin.file:
+        path: "{{ compose_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: SCP copy archive from seed to target
+      ansible.builtin.command: >
+        sshpass -p '{{ ansible_ssh_pass }}'
+        scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+        {{ seed_user }}@{{ seed_host }}:/home/user/bakery_web_2.0.6.tar
+        {{ ansible_user }}@{{ inventory_hostname }}:/home/box/bakery_web_2.0.6.tar
+      delegate_to: "{{ seed_host }}"
+      register: scp_archive_result
+      changed_when: scp_archive_result.rc == 0
+      failed_when: scp_archive_result.rc != 0
+
+    - name: SCP copy new docker-compose.yml from seed to target
+      ansible.builtin.command: >
+        sshpass -p '{{ ansible_ssh_pass }}'
+        scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+        {{ seed_user }}@{{ seed_host }}:/home/user/docker-compose-2-0-6.yml
+        {{ ansible_user }}@{{ inventory_hostname }}:{{ compose_dir }}/docker-compose-2-0-6.yml
+      delegate_to: "{{ seed_host }}"
+      register: scp_compose_result
+      changed_when: scp_compose_result.rc == 0
+      failed_when: scp_compose_result.rc != 0
+
+    - name: SCP copy new config from seed to target
+      ansible.builtin.command: >
+        sshpass -p '{{ ansible_ssh_pass }}'
+        scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+        {{ seed_user }}@{{ seed_host }}:/home/user/config_bakery_web_2.0.6.yaml
+        {{ ansible_user }}@{{ inventory_hostname }}:/home/box/config_bakery_web_2.0.6.yaml
+      delegate_to: "{{ seed_host }}"
+      register: scp_config_result
+      changed_when: scp_config_result.rc == 0
+      failed_when: scp_config_result.rc != 0
+
+    - name: Load Docker image from archive
+      ansible.builtin.command: docker load -i /home/box/bakery_web_2.0.6.tar
+      args:
+        chdir: /home/box
+      register: docker_load_result
+      failed_when: docker_load_result.rc != 0
+
+    - name: Stop Docker Compose services
+      ansible.builtin.command: docker compose down
+      args:
+        chdir: "{{ compose_dir }}"
+      register: compose_down_result
+      ignore_errors: yes
+
+    - name: Backup existing docker-compose.yml
+      ansible.builtin.command: mv "{{ compose_dir }}/docker-compose.yml" "{{ compose_dir }}/docker-compose.yml.backup"
+      args:
+        creates: "{{ compose_dir }}/docker-compose.yml.backup"
+      ignore_errors: yes
+
+    - name: Move new docker-compose into place
+      ansible.builtin.command: mv /home/box/docker-compose-2-0-6.yml {{ compose_dir }}/docker-compose.yml
+      args:
+        creates: "{{ compose_dir }}/docker-compose.yml"
+
+    - name: Start Docker Compose services with new configuration
+      ansible.builtin.command: docker compose up -d
+      args:
+        chdir: "{{ compose_dir }}"
+      register: compose_up_result
+      failed_when: compose_up_result.rc != 0
+
+    - name: Show final status
+      ansible.builtin.debug:
+        msg: |
+          Host: {{ inventory_hostname }}
+          Archive copied: {{ scp_archive_result.rc == 0 }}
+          Compose copied: {{ scp_compose_result.rc == 0 }}
+          Config copied: {{ scp_config_result.rc == 0 }}
+          Docker loaded: {{ docker_load_result.rc == 0 }}
+          Services started: {{ compose_up_result.rc == 0 }}
