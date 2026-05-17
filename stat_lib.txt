@@ -1,0 +1,38 @@
+1/ # 1. Компиляция в объектные файлы (.o)
+g++ -c -O2 -std=c++17 src1.cpp src2.cpp -Iinclude/
+
+# 2. Упаковка в статическую библиотеку
+ar rcs libmylib.a src1.o src2.o
+
+# (опционально) Удалить временные .o
+rm src1.o src2.o
+
+
+2/ cmake_minimum_required(VERSION 3.15)
+project(MyLib VERSION 1.0 LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Указываем исходники
+set(SOURCES src/src1.cpp src/src2.cpp)
+
+# Создаём статическую библиотеку
+add_library(mylib STATIC ${SOURCES})
+
+# Указываем, где лежат заголовки (PUBLIC = будут видны тем, кто подключит библиотеку)
+target_include_directories(mylib PUBLIC include/)
+
+# Опционально: требования к компилятору/флагам
+target_compile_features(mylib PUBLIC cxx_std_17)
+
+
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+
+
+MyLib-1.0/
+├── include/          # Все .h/.hpp, которые нужны пользователю
+├── lib/
+│   └── libmylib.a    # или mylib.lib
+└── README.md         # Инструкции по подключению /передача
