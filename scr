@@ -1,0 +1,101 @@
+#!/bin/bash
+
+# --- НАСТРОЙКИ ---
+# Порт и путь (ручка) одинаковые для всех
+PORT="8080"
+ENDPOINT="api/v1/status" # Пример пути
+DATA="2"                # Данные, которые отправляем (-d 2)
+
+# Список IP-адресов (можно добавить сколько угодно)
+IPS=(
+    "192.168.1.10"
+    "192.168.1.15"
+    "10.0.0.50"
+    "172.16.0.5"
+)
+
+# --- СКРИПТ ---
+echo "Начинаем отправку запросов..."
+
+for IP in "${IPS[@]}"; do
+    echo "Обработка IP: $IP"
+    
+    # Выполняем curl
+    # -s (silent) убирает прогресс-бар, -w выводит код ответа
+    curl -X POST "http://${IP}:${PORT}/${ENDPOINT}" \
+         -H "Content-Type: text/plain" \
+         -d "${DATA}" \
+         -w " [HTTP Code: %{http_code}]\n"
+    
+    # Небольшая пауза между запросами (опционально)
+    sleep 1
+done
+
+echo "Готово!"
+
+
+
+Как запустить:
+
+Создай файл send_curl.sh.
+Вставь код.
+В терминале: chmod +x send_curl.sh (сделать исполняемым).
+Запустить: ./send_curl.sh.
+
+
+
+python:
+import subprocess
+import time
+
+# --- НАСТРОЙКИ ---
+PORT = "8080"
+ENDPOINT = "api/v1/status"
+DATA = "2"
+
+# Список IP-адресов
+IPS = [
+    "192.168.1.10",
+    "192.168.1.15",
+    "10.0.0.50"
+]
+
+def send_curl(ip):
+    # Формируем URL
+    url = f"http://{ip}:{PORT}/{ENDPOINT}"
+    
+    # Формируем команду (список аргументов для subprocess)
+    # Исправляем "Context-type" на стандартный "Content-Type"
+    cmd = [
+        "curl", 
+        "-X", "POST", 
+        url, 
+        "-H", "Content-Type: text/plain", 
+        "-d", DATA
+    ]
+    
+    print(f"[+] Sending to {ip}...")
+    
+    try:
+        # Запускаем процесс
+        # capture_output=True заставляет Python не выводить мусор в консоль, а записывать его
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        
+        # Выводим ответ сервера
+        if result.returncode == 0:
+            print(f"    Response: {result.stdout.strip()}")
+        else:
+            print(f"    Error: {result.stderr.strip()}")
+            
+    except Exception as e:
+        print(f"    Failed: {e}")
+
+# --- ЗАПУСК ---
+if __name__ == "__main__":
+    print(f"Total IPs: {len(IPS)}")
+    for ip in IPS:
+        send_curl(ip)
+        time.sleep(1) # Пауза 1 секунда
+    print("Done.")
+
+Данные: -d 2 — отправляет число 2 как текстовую строку. Если сервер принимает JSON, формат должен быть {"value": 2}, 
